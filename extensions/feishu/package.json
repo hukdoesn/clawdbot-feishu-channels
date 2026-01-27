@@ -1,0 +1,39 @@
+{
+  "name": "@clawdbot/feishu",
+  "version": "2026.1.25",
+  "type": "module",
+  "description": "Clawdbot Feishu (Lark) channel plugin",
+  "clawdbot": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "channel": {
+      "id": "feishu",
+      "label": "Feishu",
+      "selectionLabel": "Feishu (Lark long connection)",
+      "docsPath": "/channels/feishu",
+      "docsLabel": "feishu",
+      "blurb": "Feishu (Lark) bot via server-side SDK long connection.",
+      "aliases": [
+        "lark"
+      ],
+      "order": 78,
+      "quickstartAllowFrom": true
+    },
+    "install": {
+      "npmSpec": "@clawdbot/feishu",
+      "localPath": "extensions/feishu",
+      "defaultChoice": "npm"
+    }
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.56.1",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "clawdbot": "workspace:*"
+  },
+  "peerDependencies": {
+    "clawdbot": "*"
+  }
+}
