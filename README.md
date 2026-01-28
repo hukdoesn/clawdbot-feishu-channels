@@ -142,14 +142,18 @@ node -e "import('node:crypto').then(c=>console.log(c.randomBytes(24).toString('h
 pnpm clawdbot config set gateway.auth.mode token
 pnpm clawdbot config set gateway.auth.token "your-strong-token"
 ```
-2) **允许远程连接（内网常用 0.0.0.0）**
+2) **允许在本机启动**
+```bash
+pnpm clawdbot config set gateway.mode local
+```
+3) **允许远程连接（内网常用 0.0.0.0）**
 ```bash
 pnpm clawdbot config set gateway.bind lan
 pnpm clawdbot config set gateway.port 18789
 ```
 > `gateway.bind=lan` 会监听 `0.0.0.0`，可被内网访问。
 
-3) **启动**
+4) **启动**
 ```bash
 pnpm clawdbot gateway run --force
 ```
@@ -174,9 +178,31 @@ Control UI（浏览器）：
   `http://SERVER_IP:18789/?token=YOUR_TOKEN`
 - 方式二：先打开 `http://SERVER_IP:18789/`，再在 Control UI 设置里填 token
 
+后台运行（nohup + 日志）：
+```bash
+pnpm build
+CLAWDBOT_GATEWAY_TOKEN="your-strong-token" \
+nohup pnpm clawdbot gateway run --force \
+> /var/log/clawdbot-gateway.log 2>&1 &
+```
+查看日志：
+```bash
+tail -n 200 /var/log/clawdbot-gateway.log
+# 或实时跟随
+tail -f /var/log/clawdbot-gateway.log
+```
+停止进程（示例）：
+```bash
+pkill -f "clawdbot gateway run"
+```
+
 安全提示：
 - 放行防火墙端口时只允许可信内网段。
 - 如果需要公网访问，务必启用 token 并使用反向代理/TLS。
+
+补充说明：
+- `gateway.mode=local` 只是允许在**当前机器**启动网关，不等于“只能本地访问”。  
+- 是否能远程访问取决于 `gateway.bind`（例如 `lan` 监听 0.0.0.0）和 `gateway.auth`。
 
 ## 启动前端控制台（可选，开发调试）
 ```bash
