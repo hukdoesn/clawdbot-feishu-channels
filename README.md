@@ -191,6 +191,22 @@ pnpm clawdbot configure
 ```
 按提示选择模型（Kimi/Moonshot）、飞书渠道、鉴权信息。向导会写入 `~/.clawdbot/clawdbot.json`，完成后重启网关生效。
 
+## 对话内切换模型（/model）
+当配置了多个模型时，可以在**飞书对话中直接切换模型**：
+```
+/model
+/model list
+/model 2
+/model moonshot/kimi-k2-0905-preview
+/model status
+```
+提示：
+- `/model` 是控制指令，需要你在 allowlist 内（或 `dmPolicy=open`）。
+- 群聊如果设置了 `requireMention=true`，记得 @ 机器人或关掉该配置。
+- `/new <model>` 可以开新会话并指定模型。
+
+![模型切换示例](images2.png)
+
 ## 重启网关
 - 开发模式（前台）：`pnpm clawdbot gateway run --force`
 - 端口占用时：`pnpm clawdbot gateway run --force --port 19001`
