@@ -85,6 +85,10 @@ export type FeishuAccountConfig = {
   replyStatusReaction?: string;
   /** Send a one-time status message (e.g. "请稍等...") when a reply starts. */
   replyStatusText?: string;
+  /** Restart the WS client if no inbound events arrive within this many seconds (0 disables). */
+  wsIdleTimeoutSeconds?: number;
+  /** Optional watchdog poll interval (seconds). Defaults to a fraction of wsIdleTimeoutSeconds. */
+  wsWatchdogIntervalSeconds?: number;
   chats?: Record<string, FeishuChatConfig>;
   defaultAccount?: string;
   historyLimit?: number;

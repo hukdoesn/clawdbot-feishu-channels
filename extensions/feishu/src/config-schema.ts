@@ -38,6 +38,8 @@ export const FeishuAccountSchemaBase = z
     routeBySenderId: z.boolean().optional(),
     replyStatusReaction: z.string().optional(),
     replyStatusText: z.string().optional(),
+    wsIdleTimeoutSeconds: z.number().int().min(0).optional(),
+    wsWatchdogIntervalSeconds: z.number().int().min(1).optional(),
     chats: z.record(z.string(), FeishuChatSchema.optional()).optional(),
     historyLimit: z.number().int().min(0).optional(),
     dmHistoryLimit: z.number().int().min(0).optional(),

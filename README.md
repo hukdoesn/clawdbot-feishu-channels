@@ -178,6 +178,17 @@ Control UI（浏览器）：
   `http://SERVER_IP:18789/?token=YOUR_TOKEN`
 - 方式二：先打开 `http://SERVER_IP:18789/`，再在 Control UI 设置里填 token
 
+如果你看到报错：
+`disconnected (1008): control ui requires HTTPS or localhost (secure context)`
+说明 **Control UI 默认只允许 HTTPS 或 localhost**。要允许 HTTP 远程访问，请开启：
+```bash
+pnpm clawdbot config set gateway.controlUi.allowInsecureAuth true
+```
+说明：该模式仅用 token 验证，安全性降低，务必限制内网访问。
+
+访问时请务必携带 token：
+`http://SERVER_IP:18789/?token=YOUR_TOKEN`
+
 后台运行（nohup + 日志）：
 ```bash
 pnpm build

@@ -10,6 +10,7 @@ import {
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   normalizeFeishuAllowlist,
@@ -37,6 +38,13 @@ const AUTO_BINDING_CACHE = new Set<string>();
 const AUTO_BINDING_IN_FLIGHT = new Set<string>();
 
 const DEFAULT_AGENT_ID = "main";
+const DEFAULT_WS_IDLE_TIMEOUT_SECONDS = 20 * 60;
+const WS_RECONNECT_POLICY = {
+  initialMs: 2000,
+  maxMs: 30_000,
+  factor: 1.8,
+  jitter: 0.25,
+};
 
 type FeishuCoreRuntime = ReturnType<typeof getFeishuRuntime>;
 
@@ -76,6 +84,24 @@ function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function computeBackoff(policy: typeof WS_RECONNECT_POLICY, attempt: number): number {
+  const base = policy.initialMs * policy.factor ** Math.max(attempt - 1, 0);
+  const jitter = base * policy.jitter * Math.random();
+  return Math.min(policy.maxMs, Math.round(base + jitter));
+}
+
+async function sleepWithAbort(ms: number, abortSignal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  try {
+    await delay(ms, undefined, { signal: abortSignal });
+  } catch (err) {
+    if (abortSignal?.aborted) {
+      throw new Error("aborted");
+    }
+    throw err;
+  }
 }
 
 function parseTimestamp(raw: string | undefined): number | undefined {
@@ -220,6 +246,22 @@ function resolveAgentDir(agentId: string): string {
 
 function resolveAgentSessionsDir(agentId: string): string {
   return path.join(resolveStateDir(), "agents", normalizeAgentId(agentId), "sessions");
+}
+
+function resolveWsIdleTimeoutSeconds(account: ResolvedFeishuAccount): number {
+  const configured = account.config.wsIdleTimeoutSeconds;
+  if (typeof configured === "number" && configured >= 0) return configured;
+  return DEFAULT_WS_IDLE_TIMEOUT_SECONDS;
+}
+
+function resolveWsWatchdogIntervalSeconds(
+  account: ResolvedFeishuAccount,
+  idleSeconds: number,
+): number {
+  const configured = account.config.wsWatchdogIntervalSeconds;
+  if (typeof configured === "number" && configured > 0) return configured;
+  if (!Number.isFinite(idleSeconds) || idleSeconds <= 0) return 0;
+  return Math.max(15, Math.min(60, Math.floor(idleSeconds / 3)));
 }
 
 function buildSenderBindingKey(accountId: string, senderId: string): string {
@@ -834,11 +876,21 @@ export async function monitorFeishuProvider(options: FeishuMonitorOptions): Prom
 
   let stopped = false;
   let wsClient: FeishuWsClient | null = null;
+  let watchdogTimer: NodeJS.Timeout | null = null;
+  let lastInboundAt = Date.now();
+  let reconnectAttempts = 0;
+  let restartInFlight: Promise<void> | null = null;
+  let restartQueued = false;
 
-  const stop = () => {
+  const stop = (reason: string = "shutdown") => {
     if (stopped) return;
     stopped = true;
     statusSink?.({ connected: false, running: false, lastDisconnectAt: Date.now() });
+    runtime.log?.(`feishu: ws stopping (${reason})`);
+    if (watchdogTimer) {
+      clearInterval(watchdogTimer);
+      watchdogTimer = null;
+    }
     const client = wsClient;
     wsClient = null;
     try {
@@ -852,7 +904,7 @@ export async function monitorFeishuProvider(options: FeishuMonitorOptions): Prom
     }
   };
 
-  const onAbort = () => stop();
+  const onAbort = () => stop("abort");
   abortSignal.addEventListener("abort", onAbort, { once: true });
 
   const dispatcher = createEventDispatcher({ account });
@@ -861,10 +913,130 @@ export async function monitorFeishuProvider(options: FeishuMonitorOptions): Prom
     throw new Error("Feishu SDK dispatcher missing register()");
   }
 
+  const idleTimeoutSeconds = resolveWsIdleTimeoutSeconds(account);
+  const watchdogIntervalSeconds = resolveWsWatchdogIntervalSeconds(account, idleTimeoutSeconds);
+
+  const startWsClient = async (label: string): Promise<boolean> => {
+    runtime.log?.(`feishu: ws connect start (${label})`);
+    wsClient = createWsClient(account);
+    const start = wsClient.start;
+    if (typeof start !== "function") {
+      throw new Error("Feishu SDK WSClient missing start()");
+    }
+
+    statusSink?.({ connected: true, lastConnectedAt: Date.now(), lastError: null });
+    const startPromise = Promise.resolve(start.call(wsClient, { eventDispatcher: dispatcher }));
+    startPromise.catch((err) => {
+      statusSink?.({ lastError: String(err) });
+      runtime.error?.(`feishu: WSClient.start failed (${label}): ${String(err)}`);
+    });
+
+    const startOutcome = await Promise.race([
+      startPromise.then(() => ({ ok: true as const })).catch((err) => ({
+        ok: false as const,
+        err,
+      })),
+      new Promise<{ ok: true; timedOut: true }>((resolve) =>
+        setTimeout(() => resolve({ ok: true, timedOut: true }), 5000),
+      ),
+    ]);
+    if (!startOutcome.ok) {
+      statusSink?.({ connected: false, lastError: String(startOutcome.err) });
+      runtime.error?.(`feishu: ws connect failed (${label}): ${String(startOutcome.err)}`);
+      return false;
+    }
+    if ("timedOut" in startOutcome) {
+      runtime.log?.(`feishu: ws connect pending (${label})`);
+    } else {
+      runtime.log?.(`feishu: ws connected (${label})`);
+    }
+    return true;
+  };
+
+  const requestRestart = (reason: string) => {
+    if (stopped || abortSignal.aborted) return;
+    if (restartInFlight) {
+      restartQueued = true;
+      return;
+    }
+    restartInFlight = (async () => {
+      reconnectAttempts += 1;
+      const delayMs = computeBackoff(WS_RECONNECT_POLICY, reconnectAttempts);
+      runtime.error?.(
+        `feishu: ws restarting (reason=${reason} attempt=${reconnectAttempts} delayMs=${delayMs})`,
+      );
+      statusSink?.({
+        connected: false,
+        lastDisconnectAt: Date.now(),
+        lastError: `ws-restart: ${reason}`,
+      });
+
+      const client = wsClient;
+      wsClient = null;
+      try {
+        if (client?.stop) {
+          await client.stop();
+        } else if (client?.close) {
+          await client.close();
+        }
+        runtime.log?.(`feishu: ws disconnected for restart (reason=${reason})`);
+      } catch (err) {
+        runtime.error?.(`feishu: stop failed: ${String(err)}`);
+      }
+
+      try {
+        await sleepWithAbort(delayMs, abortSignal);
+      } catch (err) {
+        if (abortSignal.aborted) return;
+        throw err;
+      }
+
+      if (stopped || abortSignal.aborted) return;
+
+      const started = await startWsClient(`restart:${reason}`);
+      if (started) {
+        reconnectAttempts = 0;
+        lastInboundAt = Date.now();
+        return;
+      }
+
+      restartQueued = true;
+    })()
+      .catch((err) => {
+        if (!abortSignal.aborted) {
+          runtime.error?.(`feishu: restart failed: ${String(err)}`);
+        }
+      })
+      .finally(() => {
+        restartInFlight = null;
+        if (restartQueued) {
+          restartQueued = false;
+          requestRestart("retry");
+        }
+      });
+  };
+
+  const ensureWatchdog = () => {
+    if (watchdogTimer) return;
+    if (idleTimeoutSeconds <= 0 || watchdogIntervalSeconds <= 0) return;
+    watchdogTimer = setInterval(() => {
+      if (stopped || abortSignal.aborted) return;
+      const idleMs = Date.now() - lastInboundAt;
+      if (idleMs < idleTimeoutSeconds * 1000) return;
+      runtime.error?.(
+        `feishu: ws idle ${Math.round(idleMs / 1000)}s; restarting connection`,
+      );
+      requestRestart("idle-timeout");
+    }, watchdogIntervalSeconds * 1000);
+    watchdogTimer.unref?.();
+  };
+
   register.call(dispatcher, {
     "im.message.receive_v1": (payload: unknown) => {
       if (stopped || abortSignal.aborted) return;
       const event = payload as FeishuMessageEventPayload;
+      lastInboundAt = Date.now();
+      statusSink?.({ lastInboundAt });
       runtime.log?.(
         `feishu: inbound event chat=${event.event?.message?.chat_id ?? "<unknown>"} ` +
           `sender=${event.event?.sender?.sender_id?.open_id ?? event.event?.sender?.sender_id?.user_id ?? "<unknown>"} ` +
@@ -885,32 +1057,12 @@ export async function monitorFeishuProvider(options: FeishuMonitorOptions): Prom
     },
   });
 
-  wsClient = createWsClient(account);
-  const start = wsClient.start;
-  if (typeof start !== "function") {
-    throw new Error("Feishu SDK WSClient missing start()");
+  statusSink?.({ running: true, lastError: null });
+  const started = await startWsClient("startup");
+  if (!started) {
+    throw new Error("Feishu WSClient.start failed");
   }
-
-  statusSink?.({ running: true, connected: true, lastConnectedAt: Date.now(), lastError: null });
-  const startPromise = Promise.resolve(start.call(wsClient, { eventDispatcher: dispatcher }));
-  startPromise.catch((err) => {
-    statusSink?.({ lastError: String(err) });
-    runtime.error?.(`feishu: WSClient.start failed: ${String(err)}`);
-    stop();
-  });
-  const startOutcome = await Promise.race([
-    startPromise.then(() => ({ ok: true as const })).catch((err) => ({
-      ok: false as const,
-      err,
-    })),
-    new Promise<{ ok: true; timedOut: true }>((resolve) =>
-      setTimeout(() => resolve({ ok: true, timedOut: true }), 5000),
-    ),
-  ]);
-  if (!startOutcome.ok) {
-    statusSink?.({ lastError: String(startOutcome.err) });
-    throw startOutcome.err;
-  }
+  ensureWatchdog();
 
   await new Promise<void>((resolve) => {
     if (abortSignal.aborted) {
