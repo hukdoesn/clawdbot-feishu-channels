@@ -11,7 +11,7 @@
 在飞书开放平台：
 1) 「凭证与基础信息」抄下 **App ID / App Secret**  
 2) 「事件安全」取 **Verification Token / Encrypt Key**  
-3) 在「API 调试台」调用 `GET /bot/v3/info`，返回的 `bot.open_id` 作为 **Bot Open ID**  
+3) 在「API 调试台」调用 `GET /bot/v3/info`，返回的 `bot.open_id` 作为 **Bot Open ID**  （可选项）
 4) 权限（租户级）至少勾选：`im:message:send_as_bot`、`im:message.group_at_msg:readonly`、`im:message.p2p_msg:readonly`；如需发图片再加 `im:resource:upload`
 5) 「事件与回调」→ 订阅方式选 **使用长连接接收事件/回调**，事件订阅添加 **接收消息 `im.message.receive_v1`**，保存并发布到整个企业
 
