@@ -122,6 +122,62 @@ pnpm clawdbot -- gateway run --force --token dev-token
 [info]: [ '[ws]', 'ws client ready' ]
 ```
 
+## 服务器部署 / 远程访问（内网）
+如果要把网关跑在服务器上，并在内网远程访问，推荐：
+1) **生成并设置 token（必需）**
+```bash
+# 方式一：交互式自动生成
+pnpm clawdbot doctor --fix
+
+# 方式二：向导里留空自动生成
+pnpm clawdbot configure
+
+# 方式三：手动生成（任选其一）
+openssl rand -hex 24
+# 或
+node -e "import('node:crypto').then(c=>console.log(c.randomBytes(24).toString('hex')))"
+```
+写入配置：
+```bash
+pnpm clawdbot config set gateway.auth.mode token
+pnpm clawdbot config set gateway.auth.token "your-strong-token"
+```
+2) **允许远程连接（内网常用 0.0.0.0）**
+```bash
+pnpm clawdbot config set gateway.bind lan
+pnpm clawdbot config set gateway.port 18789
+```
+> `gateway.bind=lan` 会监听 `0.0.0.0`，可被内网访问。
+
+3) **启动**
+```bash
+pnpm clawdbot gateway run --force
+```
+
+可选：
+- 若不想把 token 写到配置里，运行时用环境变量即可：
+```bash
+CLAWDBOT_GATEWAY_TOKEN="your-strong-token" pnpm clawdbot gateway run --force
+```
+- 自定义监听地址（仍是 0.0.0.0）：
+```bash
+pnpm clawdbot config set gateway.bind custom
+pnpm clawdbot config set gateway.customBindHost "0.0.0.0"
+```
+
+远程验证（本地机器）：
+```bash
+pnpm clawdbot gateway status --url ws://SERVER_IP:18789 --token "your-strong-token"
+```
+Control UI（浏览器）：
+- 方式一：直接带 token  
+  `http://SERVER_IP:18789/?token=YOUR_TOKEN`
+- 方式二：先打开 `http://SERVER_IP:18789/`，再在 Control UI 设置里填 token
+
+安全提示：
+- 放行防火墙端口时只允许可信内网段。
+- 如果需要公网访问，务必启用 token 并使用反向代理/TLS。
+
 ## 启动前端控制台（可选，开发调试）
 ```bash
 pnpm ui:dev   # Vite 前端，默认 http://localhost:5173
