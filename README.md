@@ -50,10 +50,71 @@ pnpm clawdbot config set channels.feishu.dmPolicy open
 pnpm clawdbot config set channels.feishu.chats."*".requireMention false   # 群聊无需 @
 ```
 
+## 多人使用：按 open_id 自动分流到独立 agent（可写回配置）
+如果你希望 **每个飞书用户独立一个 agent**（自动隔离会话），开启这个开关即可：
+```bash
+pnpm clawdbot config set channels.feishu.routeBySenderId true
+```
+
+启用后：
+- 每个飞书用户的 `open_id` 会被当作 `agentId`
+- 首次对话会**自动写入 `clawdbot.json`**（`agents.list` + `bindings`）
+- 之后你可以直接在配置里看到自动生成的绑定关系
+
+示例（自动落盘后）：
+```json
+{
+  "agents": {
+    "list": [
+      { "id": "main", "workspace": "/path/to/main" },
+      { "id": "ou_84aad35d084aa403a838cf73ee18467" }
+    ]
+  },
+  "bindings": [
+    {
+      "agentId": "ou_84aad35d084aa403a838cf73ee18467",
+      "match": {
+        "channel": "feishu",
+        "accountId": "default",
+        "senderId": "ou_84aad35d084aa403a838cf73ee18467"
+      }
+    }
+  ]
+}
+```
+
+注意：
+- 这个写回会 **重写配置文件为标准 JSON**，JSON5 注释/`$include` 会被扁平化。
+- 会自动创建每个 agent 的 workspace/agentDir/sessions 目录（首次对话时创建）。
+- 若你更倾向手动绑定，也可以关闭 `routeBySenderId` 并只用 `bindings`。
+
+## 对话状态提示（文字）
+如果希望用户发消息后立即看到“正在生成”的提示，可以发送一条**提示消息**：
+```bash
+pnpm clawdbot config set channels.feishu.replyStatusText "请稍等..."
+```
+说明：
+- 该提示是一条普通消息，会保留（不会自动撤回）。
+- 默认不启用；如需关闭，把 `replyStatusText` 设为空字符串即可。
+
+可选（不发消息）：用**消息表情回复**替代提示消息：
+```bash
+pnpm clawdbot config set channels.feishu.replyStatusReaction "SMILE"
+```
+- 该表情会加在**用户发送的那条消息**上，回复发出前自动移除。
+- `replyStatusReaction` 需要填飞书的 `emoji_type`（例如 `SMILE`、`THUMBSUP`）。完整列表见官方表情文案说明：https://s.apifox.cn/apidoc/docs-site/532425/doc-398404
+- 如需关闭，把 `replyStatusReaction` 设为空字符串即可。
+
 ## 启动后端网关
 ```bash
 pnpm clawdbot gateway run --force
 # 默认端口 18789，如被占用可加 --port <自定义>
+```
+如果需要临时 token（例如你刚重置过配置）：
+```bash
+CLAWDBOT_GATEWAY_TOKEN=dev-token pnpm clawdbot gateway run --force
+# 或确保 pnpm 透传参数：
+pnpm clawdbot -- gateway run --force --token dev-token
 ```
 终端应看到：
 ```
@@ -100,6 +161,27 @@ pnpm clawdbot channels status --probe --json --no-color | jq '.channels.feishu'
 - **已连接但没消息**：通常是飞书后台订阅未保存成功，或代理/DNS 阻塞到 `open.feishu.cn`。  
 - **群里不触发**：检查 `requireMention` 是否仍为 true，或 `botOpenId` 是否填写。  
 - **端口占用**：用 `pnpm clawdbot gateway run --force --port 19001` 改端口。
+- **Gateway auth is set to token, but no token is configured**：
+  1) 临时启动：`CLAWDBOT_GATEWAY_TOKEN=dev-token pnpm clawdbot gateway run --force`  
+  2) 永久写入配置：
+```bash
+pnpm clawdbot config set gateway.auth.mode token
+pnpm clawdbot config set gateway.auth.token dev-token
+pnpm clawdbot config set gateway.mode local
+```
+
+## 清理/重置注意
+- **不建议直接删除整个 `~/.clawdbot`**，因为里面包含配置与 token。  
+- 如果确实删了，需要重新写回最小配置（或重新跑 `pnpm clawdbot configure`）：
+```bash
+pnpm clawdbot config set gateway.mode local
+pnpm clawdbot config set gateway.auth.mode token
+pnpm clawdbot config set gateway.auth.token dev-token
+pnpm clawdbot config set channels.feishu.enabled true
+pnpm clawdbot config set plugins.entries.feishu.enabled true
+pnpm clawdbot config set channels.feishu.routeBySenderId true
+```
+只想清理会话历史时，删除 `~/.clawdbot/agents/<agentId>/sessions` 即可，不必动整个目录。
 
 ## 效果图
 

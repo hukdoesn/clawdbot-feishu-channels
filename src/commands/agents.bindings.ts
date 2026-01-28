@@ -11,6 +11,7 @@ function bindingMatchKey(match: AgentBinding["match"]) {
   return [
     match.channel,
     accountId,
+    match.senderId?.trim() ?? "",
     match.peer?.kind ?? "",
     match.peer?.id ?? "",
     match.guildId ?? "",
@@ -22,6 +23,7 @@ export function describeBinding(binding: AgentBinding) {
   const match = binding.match;
   const parts = [match.channel];
   if (match.accountId) parts.push(`accountId=${match.accountId}`);
+  if (match.senderId) parts.push(`senderId=${match.senderId}`);
   if (match.peer) parts.push(`peer=${match.peer.kind}:${match.peer.id}`);
   if (match.guildId) parts.push(`guild=${match.guildId}`);
   if (match.teamId) parts.push(`team=${match.teamId}`);

@@ -21,6 +21,9 @@ export type ResolveAgentRouteInput = {
   cfg: ClawdbotConfig;
   channel: string;
   accountId?: string | null;
+  senderId?: string | null;
+  fallbackAgentId?: string | null;
+  allowUnknownAgentId?: boolean;
   peer?: RoutePeer | null;
   guildId?: string | null;
   teamId?: string | null;
@@ -36,11 +39,13 @@ export type ResolvedAgentRoute = {
   mainSessionKey: string;
   /** Match description for debugging/logging. */
   matchedBy:
+    | "binding.sender"
     | "binding.peer"
     | "binding.guild"
     | "binding.team"
     | "binding.account"
     | "binding.channel"
+    | "fallback"
     | "default";
 };
 
@@ -124,6 +129,15 @@ function matchesPeer(
   return kind === peer.kind && id === peer.id;
 }
 
+function matchesSender(
+  match: { senderId?: string | undefined } | undefined,
+  senderId: string,
+): boolean {
+  const id = normalizeId(match?.senderId);
+  if (!id) return false;
+  return id === senderId;
+}
+
 function matchesGuild(
   match: { guildId?: string | undefined } | undefined,
   guildId: string,
@@ -139,12 +153,19 @@ function matchesTeam(match: { teamId?: string | undefined } | undefined, teamId:
   return id === teamId;
 }
 
+function hasSender(match: { senderId?: string | undefined } | undefined): boolean {
+  return Boolean(normalizeId(match?.senderId));
+}
+
 export function resolveAgentRoute(input: ResolveAgentRouteInput): ResolvedAgentRoute {
   const channel = normalizeToken(input.channel);
   const accountId = normalizeAccountId(input.accountId);
+  const senderId = normalizeId(input.senderId);
+  const fallbackAgentId = normalizeId(input.fallbackAgentId);
   const peer = input.peer ? { kind: input.peer.kind, id: normalizeId(input.peer.id) } : null;
   const guildId = normalizeId(input.guildId);
   const teamId = normalizeId(input.teamId);
+  const allowUnknownAgentId = input.allowUnknownAgentId === true;
 
   const bindings = listBindings(input.cfg).filter((binding) => {
     if (!binding || typeof binding !== "object") return false;
@@ -156,7 +177,9 @@ export function resolveAgentRoute(input: ResolveAgentRouteInput): ResolvedAgentR
   const identityLinks = input.cfg.session?.identityLinks;
 
   const choose = (agentId: string, matchedBy: ResolvedAgentRoute["matchedBy"]) => {
-    const resolvedAgentId = pickFirstExistingAgentId(input.cfg, agentId);
+    const resolvedAgentId = allowUnknownAgentId
+      ? sanitizeAgentId(agentId)
+      : pickFirstExistingAgentId(input.cfg, agentId);
     const sessionKey = buildAgentSessionKey({
       agentId: resolvedAgentId,
       channel,
@@ -178,6 +201,11 @@ export function resolveAgentRoute(input: ResolveAgentRouteInput): ResolvedAgentR
     };
   };
 
+  if (senderId) {
+    const senderMatch = bindings.find((b) => matchesSender(b.match, senderId));
+    if (senderMatch) return choose(senderMatch.agentId, "binding.sender");
+  }
+
   if (peer) {
     const peerMatch = bindings.find((b) => matchesPeer(b.match, peer));
     if (peerMatch) return choose(peerMatch.agentId, "binding.peer");
@@ -195,15 +223,25 @@ export function resolveAgentRoute(input: ResolveAgentRouteInput): ResolvedAgentR
 
   const accountMatch = bindings.find(
     (b) =>
-      b.match?.accountId?.trim() !== "*" && !b.match?.peer && !b.match?.guildId && !b.match?.teamId,
+      b.match?.accountId?.trim() !== "*" &&
+      !b.match?.peer &&
+      !b.match?.guildId &&
+      !b.match?.teamId &&
+      !hasSender(b.match),
   );
   if (accountMatch) return choose(accountMatch.agentId, "binding.account");
 
   const anyAccountMatch = bindings.find(
     (b) =>
-      b.match?.accountId?.trim() === "*" && !b.match?.peer && !b.match?.guildId && !b.match?.teamId,
+      b.match?.accountId?.trim() === "*" &&
+      !b.match?.peer &&
+      !b.match?.guildId &&
+      !b.match?.teamId &&
+      !hasSender(b.match),
   );
   if (anyAccountMatch) return choose(anyAccountMatch.agentId, "binding.channel");
+
+  if (fallbackAgentId) return choose(fallbackAgentId, "fallback");
 
   return choose(resolveDefaultAgentId(input.cfg), "default");
 }

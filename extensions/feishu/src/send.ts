@@ -12,6 +12,14 @@ type FeishuClient = {
         params: { receive_id_type: "chat_id" | "open_id" };
         data: { receive_id: string; msg_type: string; content: string };
       }) => Promise<unknown>;
+      delete?: (params: { path: { message_id: string } }) => Promise<unknown>;
+    };
+    messageReaction?: {
+      create?: (params: {
+        path: { message_id: string };
+        data: { reaction_type: { emoji_type: string } };
+      }) => Promise<unknown>;
+      delete?: (params: { path: { message_id: string; reaction_id: string } }) => Promise<unknown>;
     };
   };
 };
@@ -103,6 +111,16 @@ function extractMessageId(response: unknown): string | null {
   return null;
 }
 
+function extractReactionId(response: unknown): string | null {
+  const record = readRecord(response);
+  const data = readRecord(record?.data);
+  const reactionId = data?.reaction_id;
+  if (typeof reactionId === "string" && reactionId.trim()) {
+    return reactionId.trim();
+  }
+  return null;
+}
+
 export async function sendTextFeishu(params: {
   account: ResolvedFeishuAccount;
   target: FeishuTarget;
@@ -146,6 +164,99 @@ export async function sendTextFeishu(params: {
 
   const messageId = extractMessageId(response) ?? `feishu-${Date.now()}`;
   return { messageId };
+}
+
+export async function addReactionFeishu(params: {
+  account: ResolvedFeishuAccount;
+  messageId: string;
+  emojiType: string;
+  signal?: AbortSignal;
+}): Promise<{ reactionId: string | null }> {
+  const { account, messageId, emojiType, signal } = params;
+  const id = messageId.trim();
+  const emoji = emojiType.trim();
+  if (!id || !emoji) return { reactionId: null };
+
+  if (signal?.aborted) {
+    throw new Error("Feishu reaction create aborted");
+  }
+
+  if (!account.configured) {
+    throw new Error(
+      `Feishu account \"${account.accountId}\" is not configured (appId/appSecret missing).`,
+    );
+  }
+
+  const client = getFeishuClient(account);
+  const create = client.im?.messageReaction?.create;
+  if (typeof create !== "function") {
+    throw new Error("Feishu SDK client missing im.messageReaction.create");
+  }
+
+  const response = await create({
+    path: { message_id: id },
+    data: { reaction_type: { emoji_type: emoji } },
+  });
+
+  return { reactionId: extractReactionId(response) };
+}
+
+export async function deleteReactionFeishu(params: {
+  account: ResolvedFeishuAccount;
+  messageId: string;
+  reactionId: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const { account, messageId, reactionId, signal } = params;
+  const id = messageId.trim();
+  const reaction = reactionId.trim();
+  if (!id || !reaction) return;
+
+  if (signal?.aborted) {
+    throw new Error("Feishu reaction delete aborted");
+  }
+
+  if (!account.configured) {
+    throw new Error(
+      `Feishu account \"${account.accountId}\" is not configured (appId/appSecret missing).`,
+    );
+  }
+
+  const client = getFeishuClient(account);
+  const del = client.im?.messageReaction?.delete;
+  if (typeof del !== "function") {
+    throw new Error("Feishu SDK client missing im.messageReaction.delete");
+  }
+
+  await del({ path: { message_id: id, reaction_id: reaction } });
+}
+
+export async function deleteMessageFeishu(params: {
+  account: ResolvedFeishuAccount;
+  messageId: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const { account, messageId, signal } = params;
+  const id = messageId.trim();
+  if (!id) return;
+
+  if (signal?.aborted) {
+    throw new Error("Feishu delete aborted");
+  }
+
+  if (!account.configured) {
+    throw new Error(
+      `Feishu account \"${account.accountId}\" is not configured (appId/appSecret missing).`,
+    );
+  }
+
+  const client = getFeishuClient(account);
+  const del = client.im?.message?.delete;
+  if (typeof del !== "function") {
+    throw new Error("Feishu SDK client missing im.message.delete");
+  }
+
+  await del({ path: { message_id: id } });
 }
 
 export function resolveFeishuSendContext(params: {

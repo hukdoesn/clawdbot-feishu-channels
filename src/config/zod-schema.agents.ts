@@ -20,6 +20,7 @@ export const BindingsSchema = z
           .object({
             channel: z.string(),
             accountId: z.string().optional(),
+            senderId: z.string().optional(),
             peer: z
               .object({
                 kind: z.union([z.literal("dm"), z.literal("group"), z.literal("channel")]),

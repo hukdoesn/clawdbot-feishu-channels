@@ -79,6 +79,12 @@ export type FeishuAccountConfig = {
   allowFrom?: string[];
   groupAllowFrom?: string[];
   groupPolicy?: GroupPolicy;
+  /** Route inbound messages to per-sender agents using open_id (fallback: user_id). */
+  routeBySenderId?: boolean;
+  /** Add a reaction to the inbound message while generating a reply (emoji_type). */
+  replyStatusReaction?: string;
+  /** Send a one-time status message (e.g. "请稍等...") when a reply starts. */
+  replyStatusText?: string;
   chats?: Record<string, FeishuChatConfig>;
   defaultAccount?: string;
   historyLimit?: number;

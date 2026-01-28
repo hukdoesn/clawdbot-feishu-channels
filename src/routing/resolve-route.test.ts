@@ -108,6 +108,38 @@ describe("resolveAgentRoute", () => {
     expect(route.matchedBy).toBe("binding.peer");
   });
 
+  test("sender binding wins over peer binding", () => {
+    const cfg: ClawdbotConfig = {
+      bindings: [
+        {
+          agentId: "alice",
+          match: {
+            channel: "feishu",
+            accountId: "default",
+            senderId: "ou_123",
+          },
+        },
+        {
+          agentId: "chat",
+          match: {
+            channel: "feishu",
+            accountId: "default",
+            peer: { kind: "group", id: "oc_chat" },
+          },
+        },
+      ],
+    };
+    const route = resolveAgentRoute({
+      cfg,
+      channel: "feishu",
+      accountId: "default",
+      senderId: "ou_123",
+      peer: { kind: "group", id: "oc_chat" },
+    });
+    expect(route.agentId).toBe("alice");
+    expect(route.matchedBy).toBe("binding.sender");
+  });
+
   test("discord channel peer binding wins over guild binding", () => {
     const cfg: ClawdbotConfig = {
       bindings: [
@@ -225,5 +257,47 @@ describe("resolveAgentRoute", () => {
     });
     expect(route.agentId).toBe("home");
     expect(route.sessionKey).toBe("agent:home:main");
+  });
+
+  test("fallbackAgentId routes to unknown agent when allowed", () => {
+    const cfg: ClawdbotConfig = {
+      agents: {
+        list: [{ id: "main", default: true, workspace: "~/clawd-main" }],
+      },
+    };
+    const route = resolveAgentRoute({
+      cfg,
+      channel: "feishu",
+      accountId: "default",
+      fallbackAgentId: "ou_ABC123",
+      allowUnknownAgentId: true,
+    });
+    expect(route.agentId).toBe("ou_abc123");
+    expect(route.matchedBy).toBe("fallback");
+  });
+
+  test("sender binding does not act as an account binding", () => {
+    const cfg: ClawdbotConfig = {
+      bindings: [
+        {
+          agentId: "alice",
+          match: {
+            channel: "feishu",
+            accountId: "default",
+            senderId: "ou_123",
+          },
+        },
+      ],
+    };
+    const route = resolveAgentRoute({
+      cfg,
+      channel: "feishu",
+      accountId: "default",
+      senderId: "ou_999",
+      fallbackAgentId: "ou_999",
+      allowUnknownAgentId: true,
+    });
+    expect(route.agentId).toBe("ou_999");
+    expect(route.matchedBy).toBe("fallback");
   });
 });

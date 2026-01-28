@@ -1,11 +1,15 @@
 import {
   createReplyPrefixContext,
   logInboundDrop,
+  normalizeAccountId,
   resolveControlCommandGate,
   type ClawdbotConfig,
   type ReplyPayload,
   type RuntimeEnv,
 } from "clawdbot/plugin-sdk";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import {
   normalizeFeishuAllowlist,
@@ -16,10 +20,11 @@ import {
   resolveFeishuRequireMention,
 } from "./policy.js";
 import { getFeishuRuntime } from "./runtime.js";
-import { sendTextFeishu } from "./send.js";
+import { addReactionFeishu, deleteReactionFeishu, sendTextFeishu } from "./send.js";
 import type {
   FeishuMessage,
   FeishuMessageEventPayload,
+  FeishuSender,
   FeishuTarget,
   ResolvedFeishuAccount,
 } from "./types.js";
@@ -28,6 +33,10 @@ import * as lark from "@larksuiteoapi/node-sdk";
 
 const CHANNEL_ID = "feishu" as const;
 const FALLBACK_TEXT_LIMIT = 4000;
+const AUTO_BINDING_CACHE = new Set<string>();
+const AUTO_BINDING_IN_FLIGHT = new Set<string>();
+
+const DEFAULT_AGENT_ID = "main";
 
 type FeishuCoreRuntime = ReturnType<typeof getFeishuRuntime>;
 
@@ -129,6 +138,19 @@ function resolveSenderIds(payload: FeishuMessageEventPayload): {
   };
 }
 
+function resolveTenantKey(params: {
+  payload: FeishuMessageEventPayload;
+  sender: FeishuSender | null;
+  event: Record<string, unknown>;
+}): string | undefined {
+  const headerKey = params.payload.header?.tenant_key?.trim();
+  if (headerKey) return headerKey;
+  const senderKey = params.sender?.tenant_key?.trim();
+  if (senderKey) return senderKey;
+  const eventKey = (params.event.tenant_key as string | undefined)?.trim();
+  return eventKey || undefined;
+}
+
 function wasMentionedByFeishu(message: FeishuMessage, botOpenId?: string): boolean {
   const mentions = message.mentions ?? [];
   if (mentions.length === 0) return false;
@@ -138,6 +160,182 @@ function wasMentionedByFeishu(message: FeishuMessage, botOpenId?: string): boole
   return mentions.some((mention) => mention.id?.open_id?.trim() === target);
 }
 
+function resolveUserPath(input: string, homedir: () => string = os.homedir): string {
+  const trimmed = input.trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.startsWith("~")) {
+    const expanded = trimmed.replace(/^~(?=$|[\\/])/, homedir());
+    return path.resolve(expanded);
+  }
+  return path.resolve(trimmed);
+}
+
+function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.CLAWDBOT_STATE_DIR?.trim();
+  if (override) return resolveUserPath(override);
+  return path.join(os.homedir(), ".clawdbot");
+}
+
+function resolveDefaultAgentWorkspaceDir(env: NodeJS.ProcessEnv = process.env): string {
+  const profile = env.CLAWDBOT_PROFILE?.trim();
+  if (profile && profile.toLowerCase() !== "default") {
+    return path.join(os.homedir(), `clawd-${profile}`);
+  }
+  return path.join(os.homedir(), "clawd");
+}
+
+function normalizeAgentId(value: string | undefined): string {
+  return (value ?? "").trim().toLowerCase();
+}
+
+function resolveDefaultAgentId(cfg: ClawdbotConfig): string {
+  const list = Array.isArray(cfg.agents?.list) ? cfg.agents?.list : [];
+  if (list.length === 0) return DEFAULT_AGENT_ID;
+  const defaults = list.filter((agent) => agent?.default);
+  const chosen = (defaults[0] ?? list[0])?.id?.trim();
+  return normalizeAgentId(chosen || DEFAULT_AGENT_ID) || DEFAULT_AGENT_ID;
+}
+
+function resolveAgentWorkspaceDir(cfg: ClawdbotConfig, agentId: string): string {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  const agents = Array.isArray(cfg.agents?.list) ? cfg.agents?.list : [];
+  const entry = agents.find(
+    (agent) => normalizeAgentId(agent?.id) === normalizedAgentId,
+  );
+  const configuredWorkspace = entry?.workspace?.trim();
+  if (configuredWorkspace) return resolveUserPath(configuredWorkspace);
+
+  const defaultAgentId = resolveDefaultAgentId(cfg);
+  const defaultsWorkspace = cfg.agents?.defaults?.workspace?.trim();
+  if (normalizedAgentId === defaultAgentId) {
+    if (defaultsWorkspace) return resolveUserPath(defaultsWorkspace);
+    return resolveDefaultAgentWorkspaceDir();
+  }
+  return path.join(os.homedir(), `clawd-${normalizedAgentId}`);
+}
+
+function resolveAgentDir(agentId: string): string {
+  return path.join(resolveStateDir(), "agents", normalizeAgentId(agentId), "agent");
+}
+
+function resolveAgentSessionsDir(agentId: string): string {
+  return path.join(resolveStateDir(), "agents", normalizeAgentId(agentId), "sessions");
+}
+
+function buildSenderBindingKey(accountId: string, senderId: string): string {
+  const normalizedAccountId = normalizeAccountId(accountId);
+  return `${normalizedAccountId}:${senderId.trim()}`;
+}
+
+async function persistFeishuSenderBinding(params: {
+  core: FeishuCoreRuntime;
+  accountId: string;
+  senderId: string;
+  agentId: string;
+  runtime: FeishuRuntimeEnv;
+}): Promise<void> {
+  const senderId = params.senderId.trim();
+  if (!senderId) return;
+  const key = buildSenderBindingKey(params.accountId, senderId);
+  if (AUTO_BINDING_CACHE.has(key) || AUTO_BINDING_IN_FLIGHT.has(key)) return;
+  AUTO_BINDING_IN_FLIGHT.add(key);
+
+  try {
+    const currentConfig = params.core.config.loadConfig();
+    const bindings = Array.isArray(currentConfig.bindings) ? [...currentConfig.bindings] : [];
+    const normalizedAccountId = normalizeAccountId(params.accountId);
+    const existing = bindings.find((binding) => {
+      if (!binding || typeof binding !== "object") return false;
+      const match = (binding as { match?: Record<string, unknown> }).match;
+      if (!match || typeof match !== "object") return false;
+      const channel = String(match.channel ?? "").trim().toLowerCase();
+      if (channel !== CHANNEL_ID) return false;
+      const matchAccountId = normalizeAccountId(match.accountId as string | undefined);
+      if (matchAccountId !== normalizedAccountId) return false;
+      const matchSenderId =
+        typeof match.senderId === "string" ? match.senderId.trim() : "";
+      return matchSenderId === senderId;
+    });
+
+    if (existing) {
+      const existingAgent = String(existing.agentId ?? "").trim().toLowerCase();
+      const desiredAgent = params.agentId.trim().toLowerCase();
+      if (existingAgent && existingAgent !== desiredAgent) {
+        params.runtime.log?.(
+          `feishu: sender binding exists for ${senderId} (agent=${existingAgent}); skipping auto-bind`,
+        );
+      }
+      AUTO_BINDING_CACHE.add(key);
+      return;
+    }
+
+    const agentId = params.agentId.trim();
+    if (!agentId) return;
+
+    const agents = currentConfig.agents ?? {};
+    const list = Array.isArray(agents.list) ? [...agents.list] : [];
+    const normalizedAgentId = normalizeAgentId(agentId);
+    const entryIndex = list.findIndex(
+      (entry) => normalizeAgentId(entry?.id) === normalizedAgentId,
+    );
+    const existingEntry = entryIndex >= 0 ? list[entryIndex] : undefined;
+
+    const workspaceDir =
+      existingEntry?.workspace?.trim() || resolveAgentWorkspaceDir(currentConfig, agentId);
+    const agentDir = existingEntry?.agentDir?.trim() || resolveAgentDir(agentId);
+    const sessionsDir = resolveAgentSessionsDir(agentId);
+
+    try {
+      await fs.mkdir(resolveUserPath(workspaceDir), { recursive: true });
+      await fs.mkdir(resolveUserPath(agentDir), { recursive: true });
+      await fs.mkdir(resolveUserPath(sessionsDir), { recursive: true });
+    } catch (err) {
+      params.runtime.error?.(
+        `feishu: failed creating agent dirs for ${agentId}: ${String(err)}`,
+      );
+      return;
+    }
+
+    if (entryIndex >= 0) {
+      list[entryIndex] = {
+        ...existingEntry,
+        workspace: existingEntry?.workspace ?? workspaceDir,
+        agentDir: existingEntry?.agentDir ?? agentDir,
+      };
+    } else {
+      list.push({
+        id: agentId,
+        workspace: workspaceDir,
+        agentDir: agentDir,
+      });
+    }
+
+    bindings.push({
+      agentId,
+      match: {
+        channel: CHANNEL_ID,
+        accountId: normalizedAccountId,
+        senderId,
+      },
+    });
+
+    const nextConfig: ClawdbotConfig = {
+      ...currentConfig,
+      bindings,
+      agents: { ...agents, list },
+    };
+    await params.core.config.writeConfigFile(nextConfig);
+    AUTO_BINDING_CACHE.add(key);
+    params.runtime.log?.(`feishu: saved sender binding ${senderId} -> agent ${agentId}`);
+  } catch (err) {
+    params.runtime.error?.(
+      `feishu: failed to persist sender binding for ${senderId}: ${String(err)}`,
+    );
+  } finally {
+    AUTO_BINDING_IN_FLIGHT.delete(key);
+  }
+}
+
 async function deliverFeishuReply(params: {
   core: FeishuCoreRuntime;
   cfg: ClawdbotConfig;
@@ -145,9 +343,10 @@ async function deliverFeishuReply(params: {
   chatId: string;
   payload: ReplyPayload;
   runtime: FeishuRuntimeEnv;
+  onBeforeSend?: () => Promise<void>;
   statusSink?: (patch: { lastOutboundAt?: number; lastError?: string | null }) => void;
 }): Promise<void> {
-  const { core, cfg, account, chatId, payload, runtime, statusSink } = params;
+  const { core, cfg, account, chatId, payload, runtime, statusSink, onBeforeSend } = params;
   const tableMode = core.channel.text.resolveMarkdownTableMode({
     cfg,
     channel: CHANNEL_ID,
@@ -172,6 +371,8 @@ async function deliverFeishuReply(params: {
   const chunks = core.channel.text.chunkMarkdownTextWithMode(combined, textLimit, chunkMode);
   const sendList = chunks.length > 0 ? chunks : [combined];
   const target: FeishuTarget = { receiveIdType: "chat_id", id: chatId };
+
+  await onBeforeSend?.();
 
   for (const chunk of sendList) {
     const body = chunk.trim();
@@ -224,6 +425,10 @@ async function handleFeishuMessage(params: {
   const senderIds = resolveSenderIds(payload);
   if (!senderIds) return;
   if (account.botOpenId && senderIds.senderOpenId === account.botOpenId) return;
+
+  const tenantKey = resolveTenantKey({ payload, sender, event });
+  const senderRouteId = senderIds.senderOpenId ?? senderIds.senderId;
+  const routeBySenderId = account.config.routeBySenderId === true;
 
   const chatId = message.chat_id?.trim() ?? (message as unknown as { chatId?: string })?.chatId;
   if (!chatId) return;
@@ -406,11 +611,26 @@ async function handleFeishuMessage(params: {
     cfg: config,
     channel: CHANNEL_ID,
     accountId: account.accountId,
+    senderId: senderRouteId,
+    teamId: tenantKey,
     peer: {
       kind: isGroup ? "group" : "dm",
       id: isGroup ? chatId : senderIds.senderId,
     },
+    ...(routeBySenderId && senderRouteId
+      ? { fallbackAgentId: senderRouteId, allowUnknownAgentId: true }
+      : {}),
   });
+
+  if (routeBySenderId && senderRouteId && route.matchedBy === "fallback") {
+    void persistFeishuSenderBinding({
+      core,
+      accountId: account.accountId,
+      senderId: senderRouteId,
+      agentId: route.agentId,
+      runtime,
+    });
+  }
 
   const fromLabel = isGroup ? `chat:${chatId}` : `user:${senderIds.senderId}`;
   const storePath = core.channel.session.resolveStorePath(config.session?.store, {
@@ -466,6 +686,70 @@ async function handleFeishuMessage(params: {
   });
 
   const prefixContext = createReplyPrefixContext({ cfg: config, agentId: route.agentId });
+  const replyStatusReaction = account.config.replyStatusReaction?.trim();
+  const replyStatusText = replyStatusReaction ? undefined : account.config.replyStatusText?.trim();
+  const inboundMessageId = message.message_id?.trim();
+  let replyStatusReactionId: string | null = null;
+  let replyStatusReactionPromise: Promise<string | null> | null = null;
+  let replyStatusCleared = false;
+
+  const ensureReplyStatusReaction = async (): Promise<string | null> => {
+    if (!replyStatusReaction || !inboundMessageId) return null;
+    if (replyStatusReactionId) return replyStatusReactionId;
+    if (!replyStatusReactionPromise) {
+      replyStatusReactionPromise = (async () => {
+        try {
+          const { reactionId } = await addReactionFeishu({
+            account,
+            messageId: inboundMessageId,
+            emojiType: replyStatusReaction,
+          });
+          replyStatusReactionId = reactionId ?? null;
+          return replyStatusReactionId;
+        } catch (err) {
+          runtime.error?.(`feishu: reply reaction failed for ${chatId}: ${String(err)}`);
+          return null;
+        }
+      })();
+    }
+    return replyStatusReactionPromise;
+  };
+
+  const clearReplyStatusReactionOnce = async () => {
+    if (replyStatusCleared) return;
+    replyStatusCleared = true;
+    const reactionId =
+      replyStatusReactionId ??
+      (replyStatusReactionPromise ? await replyStatusReactionPromise.catch(() => null) : null);
+    if (!reactionId || !inboundMessageId) return;
+    try {
+      await deleteReactionFeishu({ account, messageId: inboundMessageId, reactionId });
+    } catch (err) {
+      runtime.error?.(`feishu: reply reaction cleanup failed for ${chatId}: ${String(err)}`);
+    }
+  };
+
+  let replyStatusTextSent = false;
+  const ensureReplyStatusText = async () => {
+    if (!replyStatusText || replyStatusTextSent) return;
+    replyStatusTextSent = true;
+    try {
+      await sendTextFeishu({
+        account,
+        target: { receiveIdType: "chat_id", id: chatId },
+        text: replyStatusText,
+        statusSink: (patch) => statusSink?.({ lastOutboundAt: patch.lastOutboundAt }),
+      });
+    } catch (err) {
+      runtime.error?.(`feishu: reply status failed for ${chatId}: ${String(err)}`);
+    }
+  };
+
+  const onReplyStart = replyStatusReaction
+    ? () => ensureReplyStatusReaction()
+    : replyStatusText
+      ? () => ensureReplyStatusText()
+      : undefined;
   const { dispatcher, replyOptions, markDispatchIdle } = core.channel.reply.createReplyDispatcherWithTyping({
     responsePrefix: prefixContext.responsePrefix,
     responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
@@ -478,13 +762,24 @@ async function handleFeishuMessage(params: {
         chatId,
         payload,
         runtime,
+        onBeforeSend: replyStatusReaction ? clearReplyStatusReactionOnce : undefined,
         statusSink,
       });
     },
     onError: (err, info) => {
       runtime.error?.(`feishu ${info.kind} reply failed: ${String(err)}`);
+      if (replyStatusReaction) {
+        void clearReplyStatusReactionOnce();
+      }
     },
+    onReplyStart,
   });
+
+  if (replyStatusReaction) {
+    void ensureReplyStatusReaction();
+  } else if (replyStatusText) {
+    void ensureReplyStatusText();
+  }
 
   await core.channel.reply.dispatchReplyFromConfig({
     ctx: ctxPayload,
@@ -500,6 +795,9 @@ async function handleFeishuMessage(params: {
       onModelSelected: prefixContext.onModelSelected,
     },
   });
+  if (replyStatusReaction) {
+    await clearReplyStatusReactionOnce();
+  }
   markDispatchIdle();
 }
 
